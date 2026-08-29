@@ -1049,7 +1049,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
-    if batch.spec_algorithm.is_dflash_family():
+    if batch.spec_algorithm.is_dflash():
         if batch.spec_info is not None:
             batch.spec_info.prepare_for_decode(batch)
         else:
@@ -1058,6 +1058,10 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
             eagle_prepare_for_decode(batch)
+    elif batch.spec_algorithm.is_dspark():
+        # DSPARK's disagg builder always returns a draft input, so spec_info is
+        # never None here; keep the unconditional stateful prep.
+        batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 

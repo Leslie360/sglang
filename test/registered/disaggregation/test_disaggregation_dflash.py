@@ -63,14 +63,37 @@ class TestDisaggregationDFlash(PDDisaggregationServerBase):
         cls.extra_decode_args = spec_args
         cls.launch_all()
 
-    def _decode_accept_length(self) -> float:
-        """Query the decode server's spec_accept_length gauge."""
+    def _decode_accept_length(self, poll_secs: float = 20.0) -> float:
+        """Lifetime-average spec acceptance on the decode server.
+
+        Prefer `avg_spec_accept_length` from /get_server_info: it is a
+        cumulative accept-tokens/forward-step average, so it is stable under
+        the low request traffic this test drives. The windowed
+        sglang:spec_accept_length Prometheus gauge under-samples at low
+        concurrency and can read ~1.0 right after a burst, so it is only a
+        fallback here (both labeled and unlabeled formats, max across lines).
+        """
+        deadline = time.monotonic() + poll_secs
+        while time.monotonic() < deadline:
+            resp = requests.get(self.decode_url + "/get_server_info", timeout=10)
+            resp.raise_for_status()
+            info = resp.json()
+            states = info.get("internal_states") or []
+            if states:
+                avg = states[0].get("avg_spec_accept_length")
+                if avg:
+                    return float(avg)
+            time.sleep(1.0)
+        # Fallback: windowed gauge. Poll once after the drive traffic so a
+        # freshly-scheduled decode batch has published a value.
         resp = requests.get(self.decode_url + "/metrics", timeout=10)
         resp.raise_for_status()
-        for line in resp.text.splitlines():
-            if line.startswith("sglang:spec_accept_length{"):
-                return float(line.split()[-1])
-        return 0.0
+        values = [
+            float(line.split()[-1])
+            for line in resp.text.splitlines()
+            if line.startswith("sglang:spec_accept_length")
+        ]
+        return max(values) if values else 0.0
 
     def _generate(self, prompt: str, max_tokens: int = 64) -> str:
         resp = requests.post(
