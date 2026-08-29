@@ -57,6 +57,7 @@ class TestDisaggregationDFlash(PDDisaggregationServerBase):
             "8",
             "--mem-fraction-static",
             "0.7",
+            "--enable-metrics",
         ]
         cls.extra_prefill_args = spec_args
         cls.extra_decode_args = spec_args
