@@ -1282,6 +1282,31 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        # ReplaySSM-GDN (fold-every-commit): like the KDA branch above, the
+        # accepted drafts already live in the per-slot ring, so there is no
+        # intermediate_ssm to scatter -- the generic spec_utils commit would
+        # handle this, but dspark/dflash call this method directly and would
+        # otherwise fall through to the scatter below and crash on a None src
+        # (intermediate_ssm is not allocated under --enable-linear-replayssm-spec).
+        # Mirror the fold logic in commit_mamba_states_after_verify (spec_utils).
+        if getattr(mamba_pool, "replayssm_spec_fold", False) and not getattr(
+            mamba_pool, "replayssm_is_kda", False
+        ):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+                commit_gdn_replayssm_fold_after_verify,
+            )
+
+            commit_gdn_replayssm_fold_after_verify(
+                spec_state=mamba_caches,
+                state_batch_indices=state_indices_tensor,
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
