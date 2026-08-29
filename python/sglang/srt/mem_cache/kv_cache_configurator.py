@@ -4,7 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
 import torch
@@ -2043,6 +2043,37 @@ class KVCacheConfigurator:
             )
         return config
 
+    @staticmethod
+    def _replayssm_ring_bytes_per_req(
+        *,
+        enable_linear_replayssm: bool,
+        enable_linear_replayssm_spec: bool,
+        is_gdn: bool,
+        is_kda: bool,
+        linear_replayssm_cache_len: int,
+        max_draft_tokens: Optional[int],
+        ring_bytes_per_req: Callable[[int], int],
+    ) -> int:
+        """Per-slot ReplaySSM ring bytes to charge the memory budget (0 if off).
+
+        Both --enable-linear-replayssm (buffered decode) and
+        --enable-linear-replayssm-spec (fold-every-commit) allocate per-slot
+        ring buffers (memory_pool._replayssm_on). Non-spec and KDA always size
+        the ring to --linear-replayssm-cache-len; spec fold sizes GDN to the
+        draft maximum (mirrors MambaPool).
+        """
+        if not (enable_linear_replayssm or enable_linear_replayssm_spec):
+            return 0
+        if not (is_gdn or is_kda):
+            return 0
+        if is_kda or enable_linear_replayssm:
+            record_len = linear_replayssm_cache_len
+        elif max_draft_tokens is not None:
+            record_len = max_draft_tokens
+        else:
+            record_len = linear_replayssm_cache_len
+        return ring_bytes_per_req(record_len)
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -2069,33 +2100,21 @@ class KVCacheConfigurator:
         )
 
         has_spec_dec = not self.spec_algorithm.is_none()
-        # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
-        # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
-        # budget goes to persistent slots (K sized like non-spec), which is how the
-        # freed ~9GB turns into higher max_running.
-        # The ring is allocated per slot but is not part of mamba_cache_per_req;
-        # the solve must charge it too or num_slots is over-provisioned.
-        replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+        # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba
+        # budget no longer reserves the (1 + D/ratio) intermediate factor -- the
+        # whole budget goes to persistent slots (K sized like non-spec), which
+        # is how the freed ~9GB turns into higher max_running. The ring is
+        # allocated per slot but is not part of mamba_cache_per_req; the solve
+        # must charge it too or num_slots is over-provisioned.
+        replayssm_ring_per_req = self._replayssm_ring_bytes_per_req(
+            enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
+            enable_linear_replayssm_spec=get_exec().mamba.enable_linear_replayssm_spec,
+            is_gdn=self.hybrid_gdn_config is not None,
+            is_kda=kimi_linear_config(self.model_config) is not None,
+            linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
+            max_draft_tokens=max_speculative_num_draft_tokens(),
+            ring_bytes_per_req=config.mamba2_cache_params.replayssm_ring_bytes_per_req,
         )
-        if replayssm_active:
-            # GDN sizes the fold window to the draft maximum; the KDA ring
-            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
-            max_draft_tokens = max_speculative_num_draft_tokens()
-            if kimi_linear_config(self.model_config) is not None:
-                record_len = get_exec().mamba.linear_replayssm_cache_len
-            elif max_draft_tokens is not None:
-                record_len = max_draft_tokens
-            else:
-                record_len = get_exec().mamba.linear_replayssm_cache_len
-            replayssm_ring_per_req = (
-                config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
-                )
-            )
-        else:
-            replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
@@ -2111,7 +2130,7 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            if has_spec_dec and replayssm_ring_per_req == 0:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
@@ -2135,7 +2154,7 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            if has_spec_dec and replayssm_ring_per_req == 0:
                 intermediate_size = (
                     stage_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
@@ -2157,7 +2176,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            if has_spec_dec and replayssm_ring_per_req == 0:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
