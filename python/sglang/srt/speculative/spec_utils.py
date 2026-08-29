@@ -1050,7 +1050,14 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
-        batch.spec_info.prepare_for_decode(batch)
+        if batch.spec_info is not None:
+            batch.spec_info.prepare_for_decode(batch)
+        else:
+            # DFLASH draft input not yet available (e.g. prefill side before the
+            # disagg draft input is received); nothing stateful to prepare.
+            from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+            eagle_prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
