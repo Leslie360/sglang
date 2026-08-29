@@ -113,7 +113,8 @@ class TestDisaggregationDFlash(PDDisaggregationServerBase):
         print(f"Decode spec_accept_length: {accept_len}")
 
         self.assertGreater(
-            accept_len, 1.0,
+            accept_len,
+            1.0,
             "DFLASH should accept > 1 token per verify step under PD; "
             "a value of 1.0 indicates speculation silently fell back to AR.",
         )
