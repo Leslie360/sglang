@@ -143,6 +143,28 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
     return shard_offsets
 
 
+def _resolve_tp_rank(
+    tp_rank: Optional[int], tp_size: Optional[int]
+) -> tuple[int, int]:
+    """Resolve tp_rank/tp_size, clamping tp_rank to 0 when tp_size == 1.
+
+    When a layer is explicitly built with tp_size == 1 (e.g. an inner module
+    that is a full replica on every rank, such as a tp=1 draft model inside a
+    TP>1 engine), there is no sharding: each rank loads the whole weight. In
+    that case the shard index must be 0 regardless of the global tensor-parallel
+    rank, otherwise a rank >= 1 computes start_idx = tp_rank * shard_size and
+    narrows out of range during weight loading. The normal TP path
+    (tp_size > 1) is unaffected.
+    """
+    if tp_rank is None:
+        tp_rank = get_parallel().tp_rank
+    if tp_size is None:
+        tp_size = get_parallel().tp_size
+    if tp_size == 1:
+        tp_rank = 0
+    return tp_rank, tp_size
+
+
 class LinearBase(torch.nn.Module):
     """Base linear layer.
 
@@ -356,10 +378,7 @@ class ColumnParallelLinear(LinearBase):
         self.use_presharded_weights = use_presharded_weights
 
         # Divide the weight matrix along the last dimension.
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
+        tp_rank, tp_size = _resolve_tp_rank(tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
@@ -559,10 +578,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         self.with_bias = bias
         self.output_sizes = output_sizes
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
+        tp_rank, tp_size = _resolve_tp_rank(tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
@@ -1003,15 +1019,13 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
+        tp_rank, tp_size = _resolve_tp_rank(tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
         if kv_tp_rank is None:
             kv_tp_rank = tp_rank
         if kv_tp_size is None:
             kv_tp_size = tp_size
+        kv_tp_rank, kv_tp_size = _resolve_tp_rank(kv_tp_rank, kv_tp_size)
         self.kv_tp_rank, self.kv_tp_size = kv_tp_rank, kv_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if kv_tp_size >= self.total_num_kv_heads:
@@ -1473,10 +1487,7 @@ class RowParallelLinear(LinearBase):
         self.use_dp_attention_reduce = use_dp_attention_reduce
 
         # Divide the weight matrix along the last dimension.
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
+        tp_rank, tp_size = _resolve_tp_rank(tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
@@ -1744,10 +1755,7 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
+        tp_rank, tp_size = _resolve_tp_rank(tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
 
         self.output_partition_sizes = [
@@ -1809,10 +1817,7 @@ class ColumnParallelBatchedLinear(nn.Module):
         tp_size: Optional[int] = None,
     ):
         super().__init__()
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
+        tp_rank, tp_size = _resolve_tp_rank(tp_rank, tp_size)
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
